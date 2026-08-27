@@ -1,0 +1,8 @@
+.pio/
+work/
+outputs/
+*.bin
+*.elf
+*.map
+*.log
+
