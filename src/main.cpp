@@ -6,10 +6,13 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <math.h>
+#include <time.h>
 
 namespace {
 constexpr uint8_t MAX_NET = 5, MAX_LOC = 5;
-constexpr uint32_t REFRESH_MS = 15UL * 60UL * 1000UL;
+constexpr uint32_t REFRESH_CHECK_MS = 3UL * 60UL * 1000UL;
+constexpr uint32_t WEATHER_RETRY_MS = REFRESH_CHECK_MS;
+constexpr uint32_t WEATHER_WATCHDOG_MS = 35UL * 60UL * 1000UL;
 
 struct Network { String ssid, password; };
 struct Location { String name; float lat = 0, lon = 0; };
@@ -24,7 +27,8 @@ bool flipped = false, weatherValid = false;
 float nowTemp = NAN, feels = NAN, wind = NAN;
 int humidity = -1, nowCode = -1;
 String updated, statusLine = "Starting";
-uint32_t lastFetch = 0, lastRetry = 0;
+uint32_t lastFetch = 0, nextFetchAt = 0, nextRefreshCheckAt = 0, lastRetry = 0;
+int64_t lastWeatherSlot = -1;
 
 lv_obj_t *activeScreen = nullptr, *keyboard = nullptr, *textarea = nullptr;
 lv_obj_t *statusLabel = nullptr;
@@ -160,6 +164,15 @@ lv_obj_t *labelAt(lv_obj_t *parent, const String &value, int x, int y, lv_align_
   lv_obj_t *l = lv_label_create(parent); lv_label_set_text(l, value.c_str());
   lv_obj_set_style_text_color(l, color, 0); lv_obj_set_style_text_font(l, font, 0);
   lv_obj_align(l, align, x, y); return l;
+}
+
+String clockTime12(const String &value) {
+  if (value.length() < 5 || value[2] != ':') return value;
+  int hour = value.substring(0, 2).toInt();
+  if (hour < 0 || hour > 23) return value;
+  int displayHour = hour % 12;
+  if (!displayHour) displayHour = 12;
+  return String(displayHour) + value.substring(2, 5) + (hour < 12 ? " AM" : " PM");
 }
 
 lv_obj_t *buttonAt(lv_obj_t *parent, const String &caption, int x, int y, int w, int h,
@@ -461,7 +474,6 @@ void showCurrent() {
     labelAt(detailCard, String(humidity) + "%", 73, 23, LV_ALIGN_TOP_LEFT, lv_color_white(), &lv_font_montserrat_12);
     labelAt(detailCard, "Wind", 8, 45, LV_ALIGN_TOP_LEFT, lv_color_hex(0xdce9ed), &lv_font_montserrat_10);
     labelAt(detailCard, String(wind, 0) + " mph", 48, 43, LV_ALIGN_TOP_LEFT, lv_color_white(), &lv_font_montserrat_12);
-    buttonAt(detailCard, "...", 98, 42, 32, 22, navEvent, reinterpret_cast<void *>(3), 0x315f72);
 
     float minTemp = hours[0].temp, maxTemp = hours[0].temp;
     for (int i = 0; i < 12; ++i) {
@@ -487,9 +499,9 @@ void showCurrent() {
         lv_obj_set_style_line_width(segment, 2, 0); lv_obj_set_style_line_color(segment, lv_color_white(), 0);
       }
       if (i == 0 || i == 3 || i == 6 || i == 9 || i == 11) {
-        String hour = hours[i].time;
-        if (hour.length() >= 5) hour = hour.substring(0, 2) + "h";
-        labelAt(hourCard, hour, x - 7, 64, LV_ALIGN_TOP_LEFT, lv_color_hex(0xdce9ed), &lv_font_montserrat_10);
+        String hour = clockTime12(hours[i].time);
+        int labelX = max(1, min(276, x - (int)hour.length() * 3));
+        labelAt(hourCard, hour, labelX, 64, LV_ALIGN_TOP_LEFT, lv_color_hex(0xdce9ed), &lv_font_montserrat_10);
       }
     }
 
@@ -508,7 +520,7 @@ void showHourly() {
   lv_obj_t *scr = newScreen("Next 12 hours");
   for (int i = 0; i < 12; ++i) {
     int col = i % 2, row = i / 2, x = col * 160, y = 34 + row * 28;
-    labelAt(scr, hours[i].time, x + 5, y, LV_ALIGN_TOP_LEFT, lv_color_hex(0x55dbe6));
+    labelAt(scr, clockTime12(hours[i].time), x + 5, y, LV_ALIGN_TOP_LEFT, lv_color_hex(0x55dbe6));
     labelAt(scr, String(hours[i].temp, 0) + "F", x + 72, y, LV_ALIGN_TOP_LEFT);
     labelAt(scr, String(hours[i].rain) + "%", x + 122, y, LV_ALIGN_TOP_LEFT,
             hours[i].rain >= 40 ? lv_color_hex(0x55dbe6) : lv_color_hex(0xbac7d4));
@@ -655,7 +667,13 @@ bool connectWifi() {
     WiFi.begin(nets[i].ssid.c_str(), nets[i].password.c_str());
     uint32_t started = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - started < 15000) { lv_timer_handler(); delay(20); }
-    if (WiFi.status() == WL_CONNECTED) { statusLine = "Connected"; Serial.println("Wi-Fi: " + WiFi.localIP().toString()); return true; }
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFi.setAutoReconnect(true);
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+      statusLine = "Connected";
+      Serial.println("Wi-Fi: " + WiFi.localIP().toString());
+      return true;
+    }
     wl_status_t result = WiFi.status();
     Serial.printf("Wi-Fi failed: SSID='%s', password length=%u, status=%d\n",
                   nets[i].ssid.c_str(), nets[i].password.length(), (int)result);
@@ -714,7 +732,29 @@ bool fetchWeather() {
     days[i].high = doc["daily"]["temperature_2m_max"][i] | NAN; days[i].low = doc["daily"]["temperature_2m_min"][i] | NAN;
     days[i].rain = doc["daily"]["precipitation_probability_max"][i] | 0; days[i].code = doc["daily"]["weather_code"][i] | -1;
   }
-  weatherValid = true; lastFetch = millis(); statusLine = "Updated"; Serial.println("Weather updated: " + l.name); return true;
+  weatherValid = true;
+  lastFetch = millis();
+  uint32_t minutesUntilRefresh = 30;
+  if (updated.length() == 5 && updated[2] == ':') {
+    int minute = updated.substring(3, 5).toInt();
+    if (minute >= 0 && minute < 60)
+      minutesUntilRefresh = minute < 30 ? 30 - minute : 60 - minute;
+  }
+  nextFetchAt = lastFetch + minutesUntilRefresh * 60UL * 1000UL;
+  time_t clockNow = time(nullptr);
+  if (clockNow >= 1700000000) {
+    lastWeatherSlot = (int64_t)clockNow / 1800;
+    struct tm utcNow;
+    gmtime_r(&clockNow, &utcNow);
+    Serial.printf("NTP time UTC: %04d-%02d-%02d %02d:%02d:%02d; half-hour slot=%lld\n",
+                  utcNow.tm_year + 1900, utcNow.tm_mon + 1, utcNow.tm_mday,
+                  utcNow.tm_hour, utcNow.tm_min, utcNow.tm_sec,
+                  (long long)lastWeatherSlot);
+  }
+  statusLine = "Updated";
+  Serial.printf("Weather updated: %s; next half-hour refresh in %lu minute(s)\n",
+                l.name.c_str(), (unsigned long)minutesUntilRefresh);
+  return true;
 }
 
 bool resolveLocationName(Location &loc) {
@@ -759,9 +799,44 @@ void setup() {
 void loop() {
   lv_timer_handler();
   bool dashboard = activeScreen && (weatherValid || (netCount && locCount));
-  if (dashboard && WiFi.status() == WL_CONNECTED && millis() - lastFetch > REFRESH_MS) { fetchWeather(); showCurrent(); }
-  if (dashboard && WiFi.status() != WL_CONNECTED && millis() - lastRetry > 30000) {
-    lastRetry = millis(); if (connectWifi()) { fetchWeather(); showCurrent(); }
+  uint32_t now = millis();
+  bool refreshCheckDue = !nextRefreshCheckAt || (int32_t)(now - nextRefreshCheckAt) >= 0;
+  time_t clockNow = time(nullptr);
+  bool clockValid = clockNow >= 1700000000;
+  int64_t currentWeatherSlot = clockValid ? (int64_t)clockNow / 1800 : -1;
+  bool clockSlotDue = refreshCheckDue && clockValid && currentWeatherSlot != lastWeatherSlot;
+  bool scheduledDue = refreshCheckDue && !clockValid && nextFetchAt && (int32_t)(now - nextFetchAt) >= 0;
+  bool initialRetryDue = refreshCheckDue && !clockValid && !nextFetchAt && now - lastFetch >= WEATHER_RETRY_MS;
+  bool watchdogDue = refreshCheckDue && weatherValid && now - lastFetch >= WEATHER_WATCHDOG_MS;
+  if (refreshCheckDue) {
+    nextRefreshCheckAt = now + REFRESH_CHECK_MS;
+    if (clockValid) {
+      struct tm utcNow;
+      gmtime_r(&clockNow, &utcNow);
+      Serial.printf("Refresh check UTC %02d:%02d:%02d; current slot=%lld, last successful slot=%lld\n",
+                    utcNow.tm_hour, utcNow.tm_min, utcNow.tm_sec,
+                    (long long)currentWeatherSlot, (long long)lastWeatherSlot);
+    } else {
+      Serial.println("Refresh check: waiting for NTP; using elapsed-time fallback");
+    }
+  }
+  if (dashboard && WiFi.status() == WL_CONNECTED &&
+      (clockSlotDue || scheduledDue || initialRetryDue || watchdogDue)) {
+    // Set the retry before starting the request so any failure cannot leave an
+    // expired half-hour deadline that hammers the weather service every loop.
+    nextFetchAt = now + WEATHER_RETRY_MS;
+    if (clockSlotDue) Serial.println("New NTP half-hour period detected");
+    else Serial.println(watchdogDue ? "Weather refresh watchdog triggered" : "Elapsed-time fallback refresh");
+    if (!fetchWeather()) Serial.println("Weather refresh failed; retrying in three minutes");
+    showCurrent();
+  }
+  if (dashboard && WiFi.status() != WL_CONNECTED && now - lastRetry > 30000) {
+    lastRetry = now;
+    if (connectWifi()) {
+      nextFetchAt = millis() + WEATHER_RETRY_MS;
+      if (!fetchWeather()) Serial.println("Weather refresh after reconnect failed; retrying in three minutes");
+      showCurrent();
+    }
   }
   delay(5);
 }
